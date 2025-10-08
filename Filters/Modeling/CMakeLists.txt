@@ -18,6 +18,7 @@ set(classes
   vtkLinearCellExtrusionFilter
   vtkLinearExtrusionFilter
   vtkLinearSubdivisionFilter
+  vtkIncenterSubdivisionFilter
   vtkLoopSubdivisionFilter
   vtkOutlineFilter
   vtkPolyDataPointSampler
