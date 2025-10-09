@@ -19,7 +19,6 @@ set(classes
   vtkLinearExtrusionFilter
   vtkLinearSubdivisionFilter
   vtkIncenterSubdivisionFilter
-  vtkUniformRemeshingFilter
   vtkDelaunayRefinementRemeshingFilter
   vtkLoopSubdivisionFilter
   vtkOutlineFilter
