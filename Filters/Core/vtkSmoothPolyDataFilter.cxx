@@ -16,8 +16,14 @@
 #include "vtkStreamingDemandDrivenPipeline.h"
 #include "vtkTriangleFilter.h"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <unordered_set>
+#include <vector>
 
 VTK_ABI_NAMESPACE_BEGIN
 vtkStandardNewMacro(vtkSmoothPolyDataFilter);
@@ -119,6 +125,7 @@ vtkSmoothPolyDataFilter::vtkSmoothPolyDataFilter()
   this->GenerateErrorVectors = 0;
 
   this->OutputPointsPrecision = vtkAlgorithm::DEFAULT_PRECISION;
+  this->SmoothingMode = VTK_SMOOTH_MODE_LAPLACIAN;
 
   this->SmoothPoints = nullptr;
 
@@ -143,6 +150,19 @@ vtkPolyData* vtkSmoothPolyDataFilter::GetSource()
     return nullptr;
   }
   return vtkPolyData::SafeDownCast(this->GetExecutive()->GetInputData(1, 0));
+}
+
+//------------------------------------------------------------------------------
+void vtkSmoothPolyDataFilter::SetUniformTriangleSmoothing(vtkTypeBool value)
+{
+  this->SetSmoothingMode(
+    value ? VTK_SMOOTH_MODE_UNIFORM_TRIANGLE : VTK_SMOOTH_MODE_LAPLACIAN);
+}
+
+//------------------------------------------------------------------------------
+vtkTypeBool vtkSmoothPolyDataFilter::GetUniformTriangleSmoothing()
+{
+  return (this->SmoothingMode == VTK_SMOOTH_MODE_UNIFORM_TRIANGLE) ? 1 : 0;
 }
 
 #define VTK_SIMPLE_VERTEX 0
@@ -274,6 +294,325 @@ void vtkSPDF_MovePoints(vtkSPDF_InternalParams<T>& params)
   vtkDebugWithObjectMacro(params.spdf, << "Performed " << iterationNumber << " smoothing passes");
 }
 
+struct vtkSPDF_EdgeKey
+{
+  vtkIdType A;
+  vtkIdType B;
+
+  bool operator==(const vtkSPDF_EdgeKey& other) const noexcept
+  {
+    return this->A == other.A && this->B == other.B;
+  }
+};
+
+struct vtkSPDF_EdgeKeyHash
+{
+  std::size_t operator()(const vtkSPDF_EdgeKey& e) const noexcept
+  {
+    std::size_t h1 = std::hash<vtkIdType>{}(e.A);
+    std::size_t h2 = std::hash<vtkIdType>{}(e.B);
+    return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+  }
+};
+
+template <typename T>
+void vtkSPDF_MovePointsUniformTriangles(vtkSPDF_InternalParams<T>& params,
+  const std::vector<std::array<vtkIdType, 3>>& triangles,
+  const std::vector<std::vector<vtkIdType>>& incidentTris)
+{
+  if (triangles.empty())
+  {
+    vtkSPDF_MovePoints(params);
+    return;
+  }
+
+  std::unordered_set<vtkSPDF_EdgeKey, vtkSPDF_EdgeKeyHash> edgeSet;
+  edgeSet.reserve(triangles.size() * 3);
+  std::vector<vtkSPDF_EdgeKey> edges;
+  edges.reserve(triangles.size() * 3);
+
+  for (const auto& tri : triangles)
+  {
+    vtkSPDF_EdgeKey e0{ std::min(tri[0], tri[1]), std::max(tri[0], tri[1]) };
+    vtkSPDF_EdgeKey e1{ std::min(tri[1], tri[2]), std::max(tri[1], tri[2]) };
+    vtkSPDF_EdgeKey e2{ std::min(tri[2], tri[0]), std::max(tri[2], tri[0]) };
+
+    if (edgeSet.insert(e0).second)
+    {
+      edges.push_back(e0);
+    }
+    if (edgeSet.insert(e1).second)
+    {
+      edges.push_back(e1);
+    }
+    if (edgeSet.insert(e2).second)
+    {
+      edges.push_back(e2);
+    }
+  }
+
+  std::vector<double> coords(static_cast<size_t>(params.numPts) * 3);
+  auto copyCurrentPoints = [&coords, &params]() {
+    T* raw = static_cast<T*>(params.newPts->GetVoidPointer(0));
+    const size_t total = coords.size();
+    for (size_t idx = 0; idx < total; ++idx)
+    {
+      coords[idx] = static_cast<double>(raw[idx]);
+    }
+  };
+
+  copyCurrentPoints();
+
+  double targetEdgeLength = 0.0;
+  if (!edges.empty())
+  {
+    double totalLength = 0.0;
+    vtkIdType count = 0;
+    for (const auto& edge : edges)
+    {
+      const double* a = &coords[3 * static_cast<size_t>(edge.A)];
+      const double* b = &coords[3 * static_cast<size_t>(edge.B)];
+      double diff[3] = { a[0] - b[0], a[1] - b[1], a[2] - b[2] };
+      double len = vtkMath::Norm(diff);
+      if (len > 0.0)
+      {
+        totalLength += len;
+        ++count;
+      }
+    }
+    if (count > 0)
+    {
+      targetEdgeLength = totalLength / static_cast<double>(count);
+    }
+  }
+
+  const double convergence = static_cast<double>(params.conv);
+  const double relaxation = static_cast<double>(params.factor);
+  const double edgeBalancingFactor = 0.5;
+  const double clampRatio = 0.5;
+  const double minEdgeLength = 1e-12;
+
+  int iterationNumber = 0;
+  double maxDist = std::numeric_limits<double>::max();
+  while (maxDist > convergence && iterationNumber < params.numberOfIterations)
+  {
+    if (iterationNumber && !(iterationNumber % 5))
+    {
+      params.spdf->UpdateProgress(0.5 + 0.5 * iterationNumber / params.numberOfIterations);
+      if (params.spdf->CheckAbort())
+      {
+        break;
+      }
+    }
+
+    std::vector<std::array<double, 3>> triCentroids(triangles.size());
+    std::vector<double> triAreas(triangles.size());
+    std::vector<std::array<double, 3>> triNormals(triangles.size());
+
+    for (size_t tid = 0; tid < triangles.size(); ++tid)
+    {
+      const auto& tri = triangles[tid];
+      const double* a = &coords[3 * static_cast<size_t>(tri[0])];
+      const double* b = &coords[3 * static_cast<size_t>(tri[1])];
+      const double* c = &coords[3 * static_cast<size_t>(tri[2])];
+
+      double ab[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+      double ac[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+      double normal[3];
+      vtkMath::Cross(ab, ac, normal);
+      double area = 0.5 * vtkMath::Norm(normal);
+
+      triAreas[tid] = area;
+      triCentroids[tid] = { (a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0,
+        (a[2] + b[2] + c[2]) / 3.0 };
+      triNormals[tid] = { normal[0], normal[1], normal[2] };
+    }
+
+    maxDist = 0.0;
+
+    for (vtkIdType pid = 0; pid < params.numPts; ++pid)
+    {
+      vtkMeshVertexPtr vertex = params.vertexPtr + pid;
+      vtkIdList* edgeList = vertex->edges;
+      vtkIdType edgeCount = edgeList ? edgeList->GetNumberOfIds() : 0;
+
+      const double* prevPt = &coords[3 * static_cast<size_t>(pid)];
+      double proposed[3] = { prevPt[0], prevPt[1], prevPt[2] };
+
+      if (vertex->type != VTK_FIXED_VERTEX && edgeCount > 0)
+      {
+        const std::vector<vtkIdType>& incident = incidentTris[static_cast<size_t>(pid)];
+        double centroidAccum[3] = { 0.0, 0.0, 0.0 };
+        double normalAccum[3] = { 0.0, 0.0, 0.0 };
+        double areaSum = 0.0;
+
+        for (vtkIdType triId : incident)
+        {
+          if (triId < 0 || static_cast<size_t>(triId) >= triAreas.size())
+          {
+            continue;
+          }
+          double area = triAreas[static_cast<size_t>(triId)];
+          if (area <= 0.0)
+          {
+            continue;
+          }
+
+          const auto& centroid = triCentroids[static_cast<size_t>(triId)];
+          centroidAccum[0] += centroid[0] * area;
+          centroidAccum[1] += centroid[1] * area;
+          centroidAccum[2] += centroid[2] * area;
+
+          const auto& normal = triNormals[static_cast<size_t>(triId)];
+          normalAccum[0] += normal[0];
+          normalAccum[1] += normal[1];
+          normalAccum[2] += normal[2];
+
+          areaSum += area;
+        }
+
+        double tangentMove[3] = { 0.0, 0.0, 0.0 };
+        double normalLen = vtkMath::Norm(normalAccum);
+
+        if (areaSum > 0.0)
+        {
+          double invArea = 1.0 / areaSum;
+          double centroid[3] = { centroidAccum[0] * invArea, centroidAccum[1] * invArea,
+            centroidAccum[2] * invArea };
+          double moveVec[3] = { centroid[0] - prevPt[0], centroid[1] - prevPt[1],
+            centroid[2] - prevPt[2] };
+
+          if (normalLen > 1e-12)
+          {
+            double nUnit[3] = { normalAccum[0] / normalLen, normalAccum[1] / normalLen,
+              normalAccum[2] / normalLen };
+            double proj = vtkMath::Dot(moveVec, nUnit);
+            moveVec[0] -= proj * nUnit[0];
+            moveVec[1] -= proj * nUnit[1];
+            moveVec[2] -= proj * nUnit[2];
+          }
+
+          tangentMove[0] = moveVec[0];
+          tangentMove[1] = moveVec[1];
+          tangentMove[2] = moveVec[2];
+        }
+
+        std::vector<vtkIdType> neighbors;
+        neighbors.reserve(static_cast<size_t>(edgeCount));
+        for (vtkIdType idx = 0; idx < edgeCount; ++idx)
+        {
+          vtkIdType nb = edgeList->GetId(idx);
+          if (nb < 0 || nb >= params.numPts)
+          {
+            continue;
+          }
+          if (std::find(neighbors.begin(), neighbors.end(), nb) == neighbors.end())
+          {
+            neighbors.push_back(nb);
+          }
+        }
+
+        double edgeAdjust[3] = { 0.0, 0.0, 0.0 };
+        if (!neighbors.empty() && targetEdgeLength > 0.0)
+        {
+          for (vtkIdType nb : neighbors)
+          {
+            const double* npt = &coords[3 * static_cast<size_t>(nb)];
+            double diff[3] = { prevPt[0] - npt[0], prevPt[1] - npt[1], prevPt[2] - npt[2] };
+            double len = vtkMath::Norm(diff);
+            if (len <= minEdgeLength)
+            {
+              continue;
+            }
+            double scale = (len - targetEdgeLength) / len;
+            edgeAdjust[0] += diff[0] * scale;
+            edgeAdjust[1] += diff[1] * scale;
+            edgeAdjust[2] += diff[2] * scale;
+          }
+
+          double invCount = 1.0 / static_cast<double>(neighbors.size());
+          edgeAdjust[0] *= invCount;
+          edgeAdjust[1] *= invCount;
+          edgeAdjust[2] *= invCount;
+
+          if (normalLen > 1e-12)
+          {
+            double nUnit[3] = { normalAccum[0] / normalLen, normalAccum[1] / normalLen,
+              normalAccum[2] / normalLen };
+            double proj = vtkMath::Dot(edgeAdjust, nUnit);
+            edgeAdjust[0] -= proj * nUnit[0];
+            edgeAdjust[1] -= proj * nUnit[1];
+            edgeAdjust[2] -= proj * nUnit[2];
+          }
+        }
+
+        proposed[0] = prevPt[0] + relaxation * tangentMove[0];
+        proposed[1] = prevPt[1] + relaxation * tangentMove[1];
+        proposed[2] = prevPt[2] + relaxation * tangentMove[2];
+
+        if (!neighbors.empty() && targetEdgeLength > 0.0)
+        {
+          proposed[0] -= relaxation * edgeBalancingFactor * edgeAdjust[0];
+          proposed[1] -= relaxation * edgeBalancingFactor * edgeAdjust[1];
+          proposed[2] -= relaxation * edgeBalancingFactor * edgeAdjust[2];
+        }
+
+        double step[3] = { proposed[0] - prevPt[0], proposed[1] - prevPt[1],
+          proposed[2] - prevPt[2] };
+        double stepLen = vtkMath::Norm(step);
+        if (targetEdgeLength > 0.0)
+        {
+          double maxStep = clampRatio * targetEdgeLength;
+          if (stepLen > maxStep && maxStep > 0.0)
+          {
+            double scale = maxStep / stepLen;
+            proposed[0] = prevPt[0] + step[0] * scale;
+            proposed[1] = prevPt[1] + step[1] * scale;
+            proposed[2] = prevPt[2] + step[2] * scale;
+          }
+        }
+      }
+
+      if (params.source)
+      {
+        vtkSmoothPoint* sPtr = params.SmoothPoints->GetSmoothPoint(pid);
+        vtkCell* cell = nullptr;
+        if (sPtr->cellId >= 0)
+        {
+          cell = params.source->GetCell(sPtr->cellId);
+        }
+
+        double closestPt[3];
+        double dist2;
+        if (!cell ||
+          cell->EvaluatePosition(proposed, closestPt, sPtr->subId, sPtr->p, dist2, params.w) == 0)
+        {
+          params.cellLocator->FindClosestPoint(proposed, closestPt, sPtr->cellId, sPtr->subId, dist2);
+        }
+        proposed[0] = closestPt[0];
+        proposed[1] = closestPt[1];
+        proposed[2] = closestPt[2];
+      }
+
+      params.newPts->SetPoint(pid, proposed);
+
+      double dispVec[3] = { proposed[0] - prevPt[0], proposed[1] - prevPt[1],
+        proposed[2] - prevPt[2] };
+      double disp = vtkMath::Norm(dispVec);
+      if (disp > maxDist)
+      {
+        maxDist = disp;
+      }
+    }
+
+    ++iterationNumber;
+    copyCurrentPoints();
+  }
+
+  vtkDebugWithObjectMacro(params.spdf,
+    << "Performed " << iterationNumber << " uniform triangle smoothing passes");
+}
+
 } // namespace
 
 //------------------------------------------------------------------------------
@@ -305,6 +644,9 @@ int vtkSmoothPolyDataFilter::RequestData(vtkInformation* vtkNotUsed(request),
   double CosEdgeAngle;    // Cosine of angle between adjacent edges
   double closestPt[3], dist2;
   vtkIdType numSimple = 0, numBEdges = 0, numFixed = 0, numFEdges = 0;
+  bool uniformModeActive = (this->SmoothingMode == VTK_SMOOTH_MODE_UNIFORM_TRIANGLE);
+  std::vector<std::array<vtkIdType, 3>> uniformTriangles;
+  std::vector<std::vector<vtkIdType>> uniformIncidentTriangles;
   vtkPolyData* Mesh;
   vtkPoints* inPts;
   vtkCellArray *inVerts, *inLines, *inPolys, *inStrips;
@@ -629,6 +971,75 @@ int vtkSmoothPolyDataFilter::RequestData(vtkInformation* vtkNotUsed(request),
   (void)numFixed;
   (void)numFEdges;
 
+  if (uniformModeActive)
+  {
+    uniformIncidentTriangles.clear();
+    uniformIncidentTriangles.resize(static_cast<size_t>(numPts));
+
+    auto addTriangle = [&](vtkIdType a, vtkIdType b, vtkIdType c) {
+      if (a < 0 || b < 0 || c < 0 || a >= numPts || b >= numPts || c >= numPts)
+      {
+        return;
+      }
+      uniformTriangles.push_back({ a, b, c });
+      vtkIdType triId = static_cast<vtkIdType>(uniformTriangles.size() - 1);
+      uniformIncidentTriangles[static_cast<size_t>(a)].push_back(triId);
+      uniformIncidentTriangles[static_cast<size_t>(b)].push_back(triId);
+      uniformIncidentTriangles[static_cast<size_t>(c)].push_back(triId);
+    };
+
+    vtkCellArray* polysForUniform = input->GetPolys();
+    if (polysForUniform)
+    {
+      polysForUniform->InitTraversal();
+      while (polysForUniform->GetNextCell(npts, pts))
+      {
+        if (npts < 3)
+        {
+          continue;
+        }
+        vtkIdType first = pts[0];
+        for (vtkIdType idx = 1; idx < npts - 1; ++idx)
+        {
+          addTriangle(first, pts[idx], pts[idx + 1]);
+        }
+      }
+    }
+
+    vtkCellArray* stripsForUniform = input->GetStrips();
+    if (stripsForUniform)
+    {
+      stripsForUniform->InitTraversal();
+      while (stripsForUniform->GetNextCell(npts, pts))
+      {
+        if (npts < 3)
+        {
+          continue;
+        }
+        bool flip = false;
+        for (vtkIdType idx = 0; idx < npts - 2; ++idx)
+        {
+          if (!flip)
+          {
+            addTriangle(pts[idx], pts[idx + 1], pts[idx + 2]);
+          }
+          else
+          {
+            addTriangle(pts[idx + 1], pts[idx], pts[idx + 2]);
+          }
+          flip = !flip;
+        }
+      }
+    }
+
+    if (uniformTriangles.empty())
+    {
+      uniformModeActive = false;
+      vtkDebugMacro("Uniform triangle smoothing requested but no triangle data was detected;"
+                    " falling back to Laplacian mode.");
+    }
+  }
+
   vtkDebugMacro(<< "Beginning smoothing iterations...");
 
   // We've setup the topology...now perform Laplacian smoothing
@@ -687,7 +1098,14 @@ int vtkSmoothPolyDataFilter::RequestData(vtkInformation* vtkNotUsed(request),
       this->RelaxationFactor, conv, numPts, Verts, source, this->SmoothPoints.get(), w.get(),
       cellLocator };
 
-    vtkSPDF_MovePoints(params);
+    if (uniformModeActive)
+    {
+      vtkSPDF_MovePointsUniformTriangles(params, uniformTriangles, uniformIncidentTriangles);
+    }
+    else
+    {
+      vtkSPDF_MovePoints(params);
+    }
   }
   else
   {
@@ -695,7 +1113,14 @@ int vtkSmoothPolyDataFilter::RequestData(vtkInformation* vtkNotUsed(request),
       static_cast<float>(this->RelaxationFactor), static_cast<float>(conv), numPts, Verts, source,
       this->SmoothPoints.get(), w.get(), cellLocator };
 
-    vtkSPDF_MovePoints(params);
+    if (uniformModeActive)
+    {
+      vtkSPDF_MovePointsUniformTriangles(params, uniformTriangles, uniformIncidentTriangles);
+    }
+    else
+    {
+      vtkSPDF_MovePoints(params);
+    }
   }
 
   // Release memory if it's been allocated
@@ -796,6 +1221,9 @@ void vtkSmoothPolyDataFilter::PrintSelf(ostream& os, vtkIndent indent)
     os << indent << "Source (none)\n";
   }
 
+  os << indent << "Smoothing Mode: "
+     << (this->SmoothingMode == VTK_SMOOTH_MODE_UNIFORM_TRIANGLE ? "UniformTriangle\n"
+                                                                 : "Laplacian\n");
   os << indent << "Output Points Precision: " << this->OutputPointsPrecision << "\n";
 }
 VTK_ABI_NAMESPACE_END

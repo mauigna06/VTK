@@ -5,7 +5,8 @@
  * @brief   adjust point positions using Laplacian smoothing
  *
  * vtkSmoothPolyDataFilter is a filter that adjusts point coordinates using
- * Laplacian smoothing. The effect is to "relax" the mesh, making the cells
+ * Laplacian smoothing or a uniform-triangle mode inspired by centroidal
+ * relaxation. The effect is to "relax" the mesh, making the cells
  * better shaped and the vertices more evenly distributed. Note that this
  * filter operates on the lines, polygons, and triangle strips composing an
  * instance of vtkPolyData. Vertex or poly-vertex cells are never modified.
@@ -109,6 +110,25 @@ public:
    */
   vtkTypeMacro(vtkSmoothPolyDataFilter, vtkPolyDataAlgorithm);
   void PrintSelf(ostream& os, vtkIndent indent) override;
+  ///@}
+
+  enum SmoothingModeEnum
+  {
+    VTK_SMOOTH_MODE_LAPLACIAN = 0,
+    VTK_SMOOTH_MODE_UNIFORM_TRIANGLE = 1
+  };
+
+  ///@{
+  /**
+   * Select the smoothing mode. The default is classic Laplacian smoothing; set
+   * to `VTK_SMOOTH_MODE_UNIFORM_TRIANGLE` to activate uniform triangle size
+   * smoothing.
+   */
+  vtkSetClampMacro(SmoothingMode, int, VTK_SMOOTH_MODE_LAPLACIAN, VTK_SMOOTH_MODE_UNIFORM_TRIANGLE);
+  vtkGetMacro(SmoothingMode, int);
+  void SetUniformTriangleSmoothing(vtkTypeBool value);
+  vtkTypeBool GetUniformTriangleSmoothing();
+  vtkBooleanMacro(UniformTriangleSmoothing, vtkTypeBool);
   ///@}
 
   ///@{
@@ -230,6 +250,7 @@ protected:
   vtkTypeBool GenerateErrorScalars;
   vtkTypeBool GenerateErrorVectors;
   int OutputPointsPrecision;
+  int SmoothingMode;
 
   std::unique_ptr<vtkSmoothPoints> SmoothPoints;
 
