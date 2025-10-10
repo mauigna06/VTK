@@ -22,7 +22,8 @@ set(classes
   vtkStructuredGridPartitioner
   vtkStructuredNeighbor
   vtkStructuredPointsGeometryFilter
-  vtkUnstructuredGridGeometryFilter)
+  vtkUnstructuredGridGeometryFilter
+  vtkIsotropicRemeshing)
 
 vtk_module_add_module(VTK::FiltersGeometry
   CLASSES ${classes})
