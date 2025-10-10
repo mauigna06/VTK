@@ -4,7 +4,9 @@
 
   A lightweight isotropic remeshing filter for vtkPolyData that performs
   centroidal-Voronoi-like relaxation (Lloyd iterations approximated by
-  area-weighted centroids on the one-ring) to improve triangle isotropy.
+  area-weighted centroids on the one-ring) to improve triangle isotropy and
+  gently drift samples from locally dense regions toward sparse regions while
+  staying on the original surface.
 
   NOTE: This implementation is a self-contained approximation of centroidal
   Voronoi tessellation suitable as an example or a starting point. It does

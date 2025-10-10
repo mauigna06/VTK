@@ -15,6 +15,7 @@
 // STL
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <functional>
 #include <unordered_map>
 #include <vector>
@@ -136,6 +137,13 @@ int vtkIsotropicRemeshing::RequestData(vtkInformation* vtkNotUsed(request),
     nbs.erase(std::unique(nbs.begin(), nbs.end()), nbs.end());
   }
 
+  std::vector<EdgeKey> edges;
+  edges.reserve(edgeUse.size());
+  for (const auto& kv : edgeUse)
+  {
+    edges.push_back(kv.first);
+  }
+
   // Identify boundary vertices if topology preservation is requested
   std::vector<char> isBoundary(numPts, 0);
   if (this->PreserveTopology)
@@ -174,13 +182,21 @@ int vtkIsotropicRemeshing::RequestData(vtkInformation* vtkNotUsed(request),
     }
   }
 
-  const double edgeBalancingFactor = 0.5;
+  const double localEdgeBalancingFactor = 0.5;
+  const double globalEdgeBalancingGain = 0.8;
   const double minEdgeLength = 1e-12;
 
   // Iterative Lloyd-like relaxation: move vertices to area-weighted centroid of triangle centroids
   std::vector<double> newPos(3*numPts);
+  std::vector<double> vertexNormals(3 * numPts, 0.0);
+  std::vector<double> edgeAccum(3 * numPts, 0.0);
+  std::vector<int> edgeCounts(numPts, 0);
   for (int it = 0; it < this->NumberOfIterations; ++it)
   {
+    std::fill(vertexNormals.begin(), vertexNormals.end(), 0.0);
+    std::fill(edgeAccum.begin(), edgeAccum.end(), 0.0);
+    std::fill(edgeCounts.begin(), edgeCounts.end(), 0);
+
     for (vtkIdType pid = 0; pid < numPts; ++pid)
     {
       double p[3];
@@ -258,6 +274,10 @@ int vtkIsotropicRemeshing::RequestData(vtkInformation* vtkNotUsed(request),
         centroidMove[2] -= dot * normal[2];
       }
 
+      vertexNormals[3 * pid + 0] = normal[0];
+      vertexNormals[3 * pid + 1] = normal[1];
+      vertexNormals[3 * pid + 2] = normal[2];
+
       double edgeAdjust[3] = { 0.0, 0.0, 0.0 };
       vtkIdType neighborCount = 0;
       if (targetEdgeLength > 0.0)
@@ -302,7 +322,7 @@ int vtkIsotropicRemeshing::RequestData(vtkInformation* vtkNotUsed(request),
 
       if (targetEdgeLength > 0.0 && neighborCount > 0)
       {
-        double scale = this->RelaxationFactor * edgeBalancingFactor;
+        double scale = this->RelaxationFactor * localEdgeBalancingFactor;
         proposed[0] -= scale * edgeAdjust[0];
         proposed[1] -= scale * edgeAdjust[1];
         proposed[2] -= scale * edgeAdjust[2];
@@ -328,6 +348,120 @@ int vtkIsotropicRemeshing::RequestData(vtkInformation* vtkNotUsed(request),
       newPos[3 * pid + 0] = proposed[0];
       newPos[3 * pid + 1] = proposed[1];
       newPos[3 * pid + 2] = proposed[2];
+    }
+
+    double lengthSum = 0.0;
+    vtkIdType lengthCount = 0;
+
+    for (const EdgeKey& edge : edges)
+    {
+      vtkIdType a = edge.A;
+      vtkIdType b = edge.B;
+      if (a < 0 || b < 0 || a >= numPts || b >= numPts)
+      {
+        continue;
+      }
+
+      const double* aPos = &newPos[3 * a];
+      const double* bPos = &newPos[3 * b];
+      double diff[3] = { bPos[0] - aPos[0], bPos[1] - aPos[1], bPos[2] - aPos[2] };
+      double len = vtkMath::Norm(diff);
+      if (len <= minEdgeLength)
+      {
+        continue;
+      }
+
+      lengthSum += len;
+      ++lengthCount;
+
+      double unit[3] = { diff[0] / len, diff[1] / len, diff[2] / len };
+      double delta = 0.5 * (len - targetEdgeLength);
+
+      if (!(this->PreserveTopology && isBoundary[a]))
+      {
+        double corr[3] = { unit[0] * delta, unit[1] * delta, unit[2] * delta };
+        double normal[3] = { vertexNormals[3 * a + 0], vertexNormals[3 * a + 1],
+          vertexNormals[3 * a + 2] };
+        double nLen = vtkMath::Norm(normal);
+        if (nLen > 0.0)
+        {
+          double dot = vtkMath::Dot(corr, normal);
+          corr[0] -= dot * normal[0];
+          corr[1] -= dot * normal[1];
+          corr[2] -= dot * normal[2];
+        }
+        edgeAccum[3 * a + 0] += corr[0];
+        edgeAccum[3 * a + 1] += corr[1];
+        edgeAccum[3 * a + 2] += corr[2];
+        ++edgeCounts[a];
+      }
+
+      if (!(this->PreserveTopology && isBoundary[b]))
+      {
+        double corr[3] = { -unit[0] * delta, -unit[1] * delta, -unit[2] * delta };
+        double normal[3] = { vertexNormals[3 * b + 0], vertexNormals[3 * b + 1],
+          vertexNormals[3 * b + 2] };
+        double nLen = vtkMath::Norm(normal);
+        if (nLen > 0.0)
+        {
+          double dot = vtkMath::Dot(corr, normal);
+          corr[0] -= dot * normal[0];
+          corr[1] -= dot * normal[1];
+          corr[2] -= dot * normal[2];
+        }
+        edgeAccum[3 * b + 0] += corr[0];
+        edgeAccum[3 * b + 1] += corr[1];
+        edgeAccum[3 * b + 2] += corr[2];
+        ++edgeCounts[b];
+      }
+    }
+
+    if (this->TargetEdgeLength <= 0.0 && lengthCount > 0)
+    {
+      targetEdgeLength = lengthSum / static_cast<double>(lengthCount);
+    }
+
+    for (vtkIdType pid = 0; pid < numPts; ++pid)
+    {
+      if (this->PreserveTopology && isBoundary[pid])
+      {
+        continue;
+      }
+
+      if (edgeCounts[pid] > 0)
+      {
+        double corr[3] = { edgeAccum[3 * pid + 0] / static_cast<double>(edgeCounts[pid]),
+          edgeAccum[3 * pid + 1] / static_cast<double>(edgeCounts[pid]),
+          edgeAccum[3 * pid + 2] / static_cast<double>(edgeCounts[pid]) };
+
+        double normal[3] = { vertexNormals[3 * pid + 0], vertexNormals[3 * pid + 1],
+          vertexNormals[3 * pid + 2] };
+        double nLen = vtkMath::Norm(normal);
+        if (nLen > 0.0)
+        {
+          double dot = vtkMath::Dot(corr, normal);
+          corr[0] -= dot * normal[0];
+          corr[1] -= dot * normal[1];
+          corr[2] -= dot * normal[2];
+        }
+
+        double corrLen = vtkMath::Norm(corr);
+        if (targetEdgeLength > 0.0)
+        {
+          double clamp = 0.25 * targetEdgeLength;
+          if (clamp > 0.0 && corrLen > clamp)
+          {
+            double s = clamp / corrLen;
+            corr[0] *= s;
+            corr[1] *= s;
+            corr[2] *= s;
+          }
+        }
+
+        newPos[3 * pid + 0] += globalEdgeBalancingGain * this->RelaxationFactor * corr[0];
+        newPos[3 * pid + 1] += globalEdgeBalancingGain * this->RelaxationFactor * corr[1];
+        newPos[3 * pid + 2] += globalEdgeBalancingGain * this->RelaxationFactor * corr[2];
+      }
     }
 
     // Apply new positions
