@@ -4,6 +4,7 @@ vtk_add_test_cxx(vtkFiltersModelingCxxTests tests
   TestLinearCellExtrusion.cxx
   TestNamedColorsIntegration.cxx
   TestPolyDataPointSampler.cxx
+  TestRemeshFilter.cxx,NO_VALID,NO_OUTPUT
   TestQuadRotationalExtrusion.cxx
   TestQuadRotationalExtrusionMultiBlock.cxx
   TestRotationalExtrusion.cxx

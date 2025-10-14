@@ -1,6 +1,7 @@
 vtk_module_test_data(
   Data/SemiDisk/SemiDisk-0.vtp
-  Data/SemiDisk/SemiDisk-1.vtp)
+  Data/SemiDisk/SemiDisk-1.vtp
+  Data/bunny.obj)
 
 if (NOT vtk_testing_cxx_disabled)
   add_subdirectory(Cxx)

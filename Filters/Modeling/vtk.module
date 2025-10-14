@@ -28,6 +28,7 @@ TEST_DEPENDS
   VTK::FiltersGeometry
   VTK::FiltersSources
   VTK::IOXML
+  VTK::IOGeometry
   VTK::IOLegacy
   VTK::InteractionStyle
   VTK::RenderingOpenGL2
