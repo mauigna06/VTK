@@ -21,7 +21,7 @@
 
 namespace vtkBotschKobbeltRemeshing
 {
-namespace
+namespace meshio_detail
 {
 class Index
 {
@@ -70,15 +70,6 @@ public:
   int normal{ -1 };
 };
 
-class MeshData
-{
-public:
-  std::vector<Eigen::Vector3d> positions;
-  std::vector<Eigen::Vector3d> uvs;
-  std::vector<Eigen::Vector3d> normals;
-  std::vector<std::vector<Index>> indices;
-};
-
 Index parseFaceIndex(const std::string& token)
 {
   std::stringstream in(token);
@@ -103,7 +94,20 @@ std::string stringRep(const Eigen::Vector3d& v)
   return std::to_string(v.x()) + " " + std::to_string(v.y()) + " " + std::to_string(v.z());
 }
 
-} // namespace
+} // namespace meshio_detail
+
+using meshio_detail::Index;
+using meshio_detail::parseFaceIndex;
+using meshio_detail::stringRep;
+
+class MeshData
+{
+public:
+  std::vector<Eigen::Vector3d> positions;
+  std::vector<Eigen::Vector3d> uvs;
+  std::vector<Eigen::Vector3d> normals;
+  std::vector<std::vector<Index>> indices;
+};
 
 extern std::vector<HalfEdge> isolated;
 
@@ -198,7 +202,7 @@ void MeshIO::checkNonManifoldVertices(const Mesh& mesh)
     HalfEdgeCIter he = f->he;
     do
     {
-      vertexFaceMap[stringRep(he->vertex->position)]++;
+  vertexFaceMap[stringRep(he->vertex->position)]++;
       he = he->next;
 
     } while (he != f->he);
@@ -410,7 +414,7 @@ bool MeshIO::read(std::ifstream& in, Mesh& mesh)
 
       while (ss >> token)
       {
-        Index index = parseFaceIndex(token);
+  Index index = parseFaceIndex(token);
         if (index.position < 0)
         {
           getline(in, line);
@@ -421,7 +425,7 @@ bool MeshIO::read(std::ifstream& in, Mesh& mesh)
         faceIndices.push_back(index);
       }
 
-      data.indices.push_back(faceIndices);
+  data.indices.push_back(faceIndices);
     }
   }
 
@@ -459,7 +463,7 @@ void MeshIO::write(std::ofstream& out, const Mesh& mesh)
     HalfEdgeIter current = he;
     do
     {
-      out << " " << vertexMap[stringRep(current->vertex->position)];
+  out << " " << vertexMap[stringRep(current->vertex->position)];
       current = current->next;
 
     } while (current != he);
@@ -511,7 +515,7 @@ bool MeshIO::BuildFromPolyData(vtkPolyData* poly, Mesh& mesh)
         continue;
       }
 
-      std::vector<Index> faceIndices;
+  std::vector<Index> faceIndices;
       faceIndices.reserve(static_cast<std::size_t>(npts));
       for (vtkIdType j = 0; j < npts; ++j)
       {

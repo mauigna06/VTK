@@ -20,6 +20,7 @@ PRIVATE_DEPENDS
   VTK::CommonCore
   VTK::CommonDataModel
   VTK::CommonTransforms
+  VTK::eigen
   VTK::FiltersCore
   VTK::FiltersSources
 TEST_DEPENDS
