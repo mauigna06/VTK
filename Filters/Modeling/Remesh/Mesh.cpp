@@ -55,6 +55,10 @@ bool Mesh::write(const std::string& fileName) const
 void Mesh::markFeatures(const double angle)
 {
     for (EdgeIter e = edges.begin(); e != edges.end(); e++) {
+        if (e->he->onBoundary || e->he->flip->onBoundary) {
+            e->feature = true;
+            continue;
+        }
         
         if (!e->he->onBoundary && !e->he->flip->onBoundary) {
             // compute dihedral angle

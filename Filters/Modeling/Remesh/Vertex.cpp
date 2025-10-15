@@ -6,6 +6,14 @@
 namespace vtkBotschKobbeltRemeshing
 {
 
+Vertex::Vertex()
+    : he()
+    , position(Eigen::Vector3d::Zero())
+    , index(-1)
+    , remove(false)
+{
+}
+
 std::vector<HalfEdge> isolated;
 
 bool Vertex::isIsolated() const

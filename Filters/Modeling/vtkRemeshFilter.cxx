@@ -4,16 +4,22 @@
 #include "Remesh/MeshIO.h"
 
 #include <vtkCellArray.h>
+#include <vtkCellData.h>
+#include <vtkFieldData.h>
 #include <vtkInformation.h>
 #include <vtkInformationVector.h>
 #include <vtkObjectFactory.h>
 #include <vtkPolyData.h>
+#include <vtkPointData.h>
 #include <vtkPoints.h>
 #include <vtkTriangleFilter.h>
 
 #include <vtkNew.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cmath>
+#include <unordered_set>
 
 VTK_ABI_NAMESPACE_BEGIN
 vtkStandardNewMacro(vtkRemeshFilter);
@@ -91,6 +97,12 @@ int vtkRemeshFilter::RequestData(
 
   output->Initialize();
   vtkBotschKobbeltRemeshing::MeshIO::CopyToPolyData(halfEdgeMesh, output);
+  output->GetPointData()->Initialize();
+  output->GetCellData()->Initialize();
+  if (input->GetFieldData())
+  {
+    output->GetFieldData()->ShallowCopy(input->GetFieldData());
+  }
 
   return 1;
 }
@@ -108,6 +120,17 @@ double vtkRemeshFilter::ComputeDefaultEdgeLength(vtkPolyData* mesh) const
   {
     return 0.0;
   }
+
+  auto encodeEdge = [](vtkIdType a, vtkIdType b) -> std::uint64_t {
+    if (a > b)
+    {
+      std::swap(a, b);
+    }
+    return (static_cast<std::uint64_t>(a) << 32) | static_cast<std::uint64_t>(b);
+  };
+
+  std::unordered_set<std::uint64_t> uniqueEdges;
+  uniqueEdges.reserve(static_cast<std::size_t>(polys->GetNumberOfCells()) * 3);
 
   polys->InitTraversal();
   vtkIdType npts = 0;
@@ -128,13 +151,17 @@ double vtkRemeshFilter::ComputeDefaultEdgeLength(vtkPolyData* mesh) const
     {
       vtkIdType id0 = pts[i];
       vtkIdType id1 = pts[(i + 1) % npts];
-      points->GetPoint(id0, p0);
-      points->GetPoint(id1, p1);
-      double dx = p0[0] - p1[0];
-      double dy = p0[1] - p1[1];
-      double dz = p0[2] - p1[2];
-      total += std::sqrt(dx * dx + dy * dy + dz * dz);
-      edgeCount++;
+      const std::uint64_t key = encodeEdge(id0, id1);
+      if (uniqueEdges.insert(key).second)
+      {
+        points->GetPoint(id0, p0);
+        points->GetPoint(id1, p1);
+        double dx = p0[0] - p1[0];
+        double dy = p0[1] - p1[1];
+        double dz = p0[2] - p1[2];
+        total += std::sqrt(dx * dx + dy * dy + dz * dz);
+        edgeCount++;
+      }
     }
   }
 

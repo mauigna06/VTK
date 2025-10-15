@@ -5,6 +5,13 @@
 namespace vtkBotschKobbeltRemeshing
 {
 
+Face::Face()
+    : he()
+    , index(-1)
+    , remove(false)
+{
+}
+
 bool Face::isBoundary() const
 {
     return he->onBoundary;

@@ -9,6 +9,8 @@ namespace vtkBotschKobbeltRemeshing
 class Vertex
 {
 public:
+    Vertex();
+
     // outgoing halfedge
     HalfEdgeIter he;
 

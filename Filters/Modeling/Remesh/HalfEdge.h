@@ -9,6 +9,8 @@ namespace vtkBotschKobbeltRemeshing
 class HalfEdge
 {
 public:
+    HalfEdge();
+
     // next halfedge around the current face
     HalfEdgeIter next;
 

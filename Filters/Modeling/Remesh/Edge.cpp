@@ -5,6 +5,14 @@
 namespace vtkBotschKobbeltRemeshing
 {
 
+Edge::Edge()
+    : he()
+    , index(-1)
+    , remove(false)
+    , feature(false)
+{
+}
+
 double Edge::lengthSquared() const
 {
     Eigen::Vector3d a = he->vertex->position;

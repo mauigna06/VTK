@@ -10,12 +10,12 @@
 #include <vtkPolyData.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <iostream>
-#include <map>
-#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -70,6 +70,38 @@ public:
   int normal{ -1 };
 };
 
+struct EdgeKey
+{
+  int A{ -1 };
+  int B{ -1 };
+
+  bool operator==(const EdgeKey& other) const noexcept
+  {
+    return this->A == other.A && this->B == other.B;
+  }
+};
+
+EdgeKey MakeEdgeKey(int a, int b)
+{
+  if (a > b)
+  {
+    std::swap(a, b);
+  }
+  EdgeKey key;
+  key.A = a;
+  key.B = b;
+  return key;
+}
+
+struct EdgeKeyHash
+{
+  std::size_t operator()(const EdgeKey& key) const noexcept
+  {
+    return (static_cast<std::size_t>(static_cast<unsigned int>(key.A)) << 32) ^
+      static_cast<unsigned int>(key.B);
+  }
+};
+
 Index parseFaceIndex(const std::string& token)
 {
   std::stringstream in(token);
@@ -97,6 +129,9 @@ std::string stringRep(const Eigen::Vector3d& v)
 } // namespace meshio_detail
 
 using meshio_detail::Index;
+using meshio_detail::EdgeKey;
+using meshio_detail::EdgeKeyHash;
+using meshio_detail::MakeEdgeKey;
 using meshio_detail::parseFaceIndex;
 using meshio_detail::stringRep;
 
@@ -113,7 +148,8 @@ extern std::vector<HalfEdge> isolated;
 
 void MeshIO::preallocateMeshElements(const MeshData& data, Mesh& mesh)
 {
-  std::set<std::pair<int, int>> edges;
+  std::unordered_set<EdgeKey, EdgeKeyHash> edges;
+  edges.reserve(data.indices.size() * 3);
   for (const auto& f : data.indices)
   {
     for (std::size_t I = 0; I < f.size(); I++)
@@ -122,12 +158,7 @@ void MeshIO::preallocateMeshElements(const MeshData& data, Mesh& mesh)
       int i = f[I].position;
       int j = f[J].position;
 
-      if (i > j)
-      {
-        std::swap(i, j);
-      }
-
-      edges.insert(std::pair<int, int>(i, j));
+      edges.insert(MakeEdgeKey(i, j));
     }
   }
 
@@ -228,10 +259,37 @@ void MeshIO::checkNonManifoldVertices(const Mesh& mesh)
 
 bool MeshIO::buildMesh(const MeshData& data, Mesh& mesh)
 {
-  std::map<std::pair<int, int>, int> edgeCount;
-  std::map<std::pair<int, int>, HalfEdgeIter> existingHalfEdges;
-  std::map<int, VertexIter> indexToVertex;
-  std::map<HalfEdgeIter, bool> hasFlipEdge;
+  const std::size_t estimatedHalfEdgeCount = data.indices.size() * 3;
+  std::unordered_map<EdgeKey, int, EdgeKeyHash> edgeCount;
+  std::unordered_map<EdgeKey, int, EdgeKeyHash> existingHalfEdges;
+  std::vector<VertexIter> indexToVertex(data.positions.size());
+  std::vector<char> halfEdgeHasFlip;
+  edgeCount.reserve(estimatedHalfEdgeCount);
+  existingHalfEdges.reserve(estimatedHalfEdgeCount);
+  halfEdgeHasFlip.reserve(estimatedHalfEdgeCount * 2);
+
+  auto HalfEdgeIndex = [&mesh](HalfEdgeIter iter) -> int {
+    return static_cast<int>(iter - mesh.halfEdges.begin());
+  };
+
+  auto MarkFlip = [&halfEdgeHasFlip, &HalfEdgeIndex](HalfEdgeIter iter, bool value) {
+    const int index = HalfEdgeIndex(iter);
+    if (index < 0)
+    {
+      return;
+    }
+    if (index >= static_cast<int>(halfEdgeHasFlip.size()))
+    {
+      halfEdgeHasFlip.resize(static_cast<std::size_t>(index) + 1, 0);
+    }
+    halfEdgeHasFlip[static_cast<std::size_t>(index)] = value ? 1 : 0;
+  };
+
+  auto HasFlip = [&halfEdgeHasFlip, &HalfEdgeIndex](HalfEdgeIter iter) -> bool {
+    const int index = HalfEdgeIndex(iter);
+    return index >= 0 && index < static_cast<int>(halfEdgeHasFlip.size()) &&
+      halfEdgeHasFlip[static_cast<std::size_t>(index)] != 0;
+  };
 
   preallocateMeshElements(data, mesh);
 
@@ -244,7 +302,7 @@ bool MeshIO::buildMesh(const MeshData& data, Mesh& mesh)
   }
 
   int faceIndex = 0;
-  bool degenerateFaces = false;
+  bool hasValidFace = false;
   for (const auto& face : data.indices)
   {
     int n = static_cast<int>(face.size());
@@ -252,12 +310,12 @@ bool MeshIO::buildMesh(const MeshData& data, Mesh& mesh)
     if (n < 3)
     {
       std::cerr << "Error: face " << faceIndex << " is degenerate" << std::endl;
-      degenerateFaces = true;
       faceIndex++;
       continue;
     }
 
     FaceIter newFace = mesh.faces.insert(mesh.faces.end(), Face());
+    hasValidFace = true;
 
     std::vector<HalfEdgeIter> halfEdges(n);
     for (int i = 0; i < n; i++)
@@ -272,45 +330,41 @@ bool MeshIO::buildMesh(const MeshData& data, Mesh& mesh)
 
       halfEdges[i]->next = halfEdges[(i + 1) % n];
       halfEdges[i]->vertex = indexToVertex[a];
+      const int currentIndex = HalfEdgeIndex(halfEdges[i]);
 
       halfEdges[i]->onBoundary = false;
-
-      hasFlipEdge[halfEdges[i]] = false;
+      MarkFlip(halfEdges[i], false);
 
       indexToVertex[a]->he = halfEdges[i];
 
       halfEdges[i]->face = newFace;
       newFace->he = halfEdges[i];
 
-      int ia = a;
-      int ib = b;
-      if (ia > ib)
+      EdgeKey edgeKey = MakeEdgeKey(a, b);
+      auto existing = existingHalfEdges.find(edgeKey);
+      if (existing != existingHalfEdges.end())
       {
-        std::swap(ia, ib);
-      }
-
-      auto edgeKey = std::pair<int, int>(ia, ib);
-      if (existingHalfEdges.find(edgeKey) != existingHalfEdges.end())
-      {
-        halfEdges[i]->flip = existingHalfEdges[edgeKey];
-        halfEdges[i]->flip->flip = halfEdges[i];
-        halfEdges[i]->edge = halfEdges[i]->flip->edge;
-        hasFlipEdge[halfEdges[i]] = true;
-        hasFlipEdge[halfEdges[i]->flip] = true;
+        HalfEdgeIter opposite = mesh.halfEdges.begin() + existing->second;
+        halfEdges[i]->flip = opposite;
+        opposite->flip = halfEdges[i];
+        halfEdges[i]->edge = opposite->edge;
+        MarkFlip(halfEdges[i], true);
+        MarkFlip(opposite, true);
       }
       else
       {
         halfEdges[i]->edge = mesh.edges.insert(mesh.edges.end(), Edge());
         halfEdges[i]->edge->he = halfEdges[i];
-        edgeCount[edgeKey] = 0;
       }
 
-      existingHalfEdges[edgeKey] = halfEdges[i];
+      existingHalfEdges[edgeKey] = currentIndex;
 
-      edgeCount[edgeKey]++;
-      if (edgeCount[edgeKey] > 2)
+      int& edgeUseCount = edgeCount[edgeKey];
+      edgeUseCount++;
+      if (edgeUseCount > 2)
       {
-        std::cerr << "Error: edge " << ia << ", " << ib << " is non manifold" << std::endl;
+        std::cerr << "Error: edge " << edgeKey.A << ", " << edgeKey.B
+                  << " is non manifold" << std::endl;
         return false;
       }
     }
@@ -318,14 +372,14 @@ bool MeshIO::buildMesh(const MeshData& data, Mesh& mesh)
     faceIndex++;
   }
 
-  if (degenerateFaces)
+  if (!hasValidFace)
   {
     return false;
   }
 
   for (HalfEdgeIter currHe = mesh.halfEdges.begin(); currHe != mesh.halfEdges.end(); currHe++)
   {
-    if (!hasFlipEdge[currHe])
+    if (!HasFlip(currHe))
     {
       FaceIter newFace = mesh.faces.insert(mesh.faces.end(), Face());
 
@@ -339,9 +393,16 @@ bool MeshIO::buildMesh(const MeshData& data, Mesh& mesh)
         he->flip = newHe;
 
         HalfEdgeIter nextHe = he->next;
-        while (hasFlipEdge[nextHe])
+        while (HasFlip(nextHe))
         {
-          nextHe = nextHe->flip->next;
+          HalfEdgeIter flipped = nextHe->flip;
+          if (flipped->onBoundary)
+          {
+            nextHe = currHe;
+            break;
+          }
+
+          nextHe = flipped->next;
         }
 
         newHe->flip = he;
@@ -350,6 +411,9 @@ bool MeshIO::buildMesh(const MeshData& data, Mesh& mesh)
         newHe->face = newFace;
 
         newFace->he = newHe;
+
+        MarkFlip(newHe, true);
+        MarkFlip(he, true);
 
         boundaryCycle.push_back(newHe);
 
@@ -361,8 +425,8 @@ bool MeshIO::buildMesh(const MeshData& data, Mesh& mesh)
       for (int i = 0; i < n; i++)
       {
         boundaryCycle[i]->next = boundaryCycle[(i + n - 1) % n];
-        hasFlipEdge[boundaryCycle[i]] = true;
-        hasFlipEdge[boundaryCycle[i]->flip] = true;
+        MarkFlip(boundaryCycle[i], true);
+        MarkFlip(boundaryCycle[i]->flip, true);
       }
       mesh.boundaries.insert(mesh.boundaries.end(), boundaryCycle[0]);
     }

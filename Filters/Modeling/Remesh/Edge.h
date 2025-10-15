@@ -9,6 +9,8 @@ namespace vtkBotschKobbeltRemeshing
 class Edge
 {
 public:
+    Edge();
+
     // one of the two half edges associated with this edge
     HalfEdgeIter he;
 
